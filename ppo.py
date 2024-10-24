@@ -3,9 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch import nn, optim
 import torch.nn.functional as F
-from concurrent.futures import ThreadPoolExecutor
+#from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
+from gym.vector import SyncVectorEnv
 
 class PPONetwork(nn.Module):
     def __init__(self, *args, **kwargs):
@@ -16,26 +17,35 @@ class PPONetwork(nn.Module):
         self.policy_hidden_dims = kwargs.get("policy_hidden_dims")
         self.value_hidden_dims = kwargs.get("value_hidden_dims")
         
-        self.shared_layers = self.build_layers(self.input_dim, self.hidden_dims)
+        self.shared_layers = self.build_layers(self.input_dim, self.hidden_dims, normalize=True)
         
-        # Normalization
-        self.shared_layers = nn.Sequential(self.shared_layers, nn.LayerNorm(self.hidden_dims[-1]))
-
         # Policy head layers
-        self.policy_layers = self.build_layers(self.hidden_dims[-1], self.policy_hidden_dims)
+        self.policy_layers = self.build_layers(self.hidden_dims[-1], self.policy_hidden_dims, normalize=True)
         self.policy_output = nn.Linear(self.policy_hidden_dims[-1], self.output_dim)
         
         # Value head layers
-        self.value_layers = self.build_layers(self.hidden_dims[-1], self.value_hidden_dims)
+        self.value_layers = self.build_layers(self.hidden_dims[-1], self.value_hidden_dims, normalize=True)
         self.value_output = nn.Linear(self.value_hidden_dims[-1], 1)
+        
+        # Apply He initialization to the layers
+        self.apply(self.he_initialization)
     
-    def build_layers(self, input_size, layer_dims):
+    def build_layers(self, input_size, layer_dims, normalize=False):
         layers = []
         for dim in layer_dims:
             layers.append(nn.Linear(input_size, dim))
+            if normalize:
+                layers.append(nn.LayerNorm(dim)) 
             layers.append(nn.ReLU())
+            #layers.append(nn.LeakyReLU())
             input_size = dim  # Set input size to the output of the last layer
         return nn.Sequential(*layers)  # Return the layers as a sequential model
+
+    def he_initialization(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, nonlinearity='relu')  # He initialization
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)  # Initialize bias as zeros
 
     def forward(self, x):
         # Pass through shared layers
@@ -68,9 +78,10 @@ class PPOWrapper:
         self.batch_shuffle = kwargs.get("batch_shuffle")
         self.checkpointing = kwargs.get("checkpointing")
         
-        # Episode parameters
-        self.episode_steps = 2500 # Maximum step to start an new episode
-        self.max_steps = 1000 # Maximum number of steps per episode
+        # Episode parameters # TODO: remove this logic
+        self.truncated_reward = kwargs.get("truncated_reward")
+        self.episode_steps = 1500 # Maximum step to start an new episode
+        self.max_steps = 100000 # Maximum number of steps per episode
         self.eval_multiplier = 1 # Evaluate the policy for 5 times the number of steps
 
         # Optimizer
@@ -88,12 +99,12 @@ class PPOWrapper:
         self.checkpoint_path = "checkpoints"   
         self.ma_factor = 0.9
         self.ma_save_ratio = 1.05
-        self.ma_load_ratio = 0.8
-        self.minimum_episode_spacing = 100
+        self.ma_load_ratio = 0.75
+        self.minimum_episode_spacing = 50
         
         self.eval_ma = 0
         self.max_eval_ma = 0
-        self.checkpoint_grace = 0.01
+        self.checkpoint_grace = 0.001
         self.latest_checkpoint_episode = 0
         self.model_save = None
         self.optimizer_save = None
@@ -131,7 +142,9 @@ class PPOWrapper:
         while steps > 0:
             state, info = self.env.reset()
             lifetime = 0
-            for _ in range(self.max_steps):
+            done = False
+            while not done:
+            #for _ in range(self.max_steps):
                 state_tensor = torch.tensor(state, dtype=torch.float32)
                 
                 # Get the policy distribution and value prediction
@@ -144,8 +157,12 @@ class PPOWrapper:
                 action = action_dist.sample().item()
                 
                 # Take the action in the environment
-                next_state, reward, done, _, _ = self.env.step(action)
-                # TODO fix truncated
+                next_state, reward, done, truncated, info = self.env.step(action)
+                
+                # Handle truncated logic
+                if truncated:
+                    done = True
+                    reward += self.truncated_reward
                 
                 # Get the log probability of the chosen action
                 log_prob = action_dist.log_prob(torch.tensor(action)).detach()
@@ -166,7 +183,7 @@ class PPOWrapper:
                     break
                 
             avg_lifetime.append(lifetime)
-
+                  
         self.avg_lifetime = np.mean(avg_lifetime)
 
         return states, actions, rewards, log_probs, dones, values
@@ -182,6 +199,7 @@ class PPOWrapper:
         advantages, returns = self.compute_advantages(rewards, dones, values)
         
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
         # TODO: Try normalize the returns
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
@@ -266,23 +284,87 @@ class PPOWrapper:
                 self.lam = self.initial_lambda * (1 - current_epoch/total_epochs)
     
     def evaluate_policy(self, episodes):
-        # Evaluate the policy without randomness
-        scores = []
-        for i in range(episodes):
-            state, info = self.env.reset()
-            done = False
-            score = 0
-            for _ in range(self.max_steps*self.eval_multiplier):
-                policy, _ = self.predict(torch.tensor(state, dtype=torch.float32))
-                action = torch.argmax(policy).item()
-                state, reward, done, _, _ = self.env.step(action)
+        # Increase the max steps for evaluation
+        max_steps = self.env.spec.max_episode_steps
+        self.env.spec.max_episode_steps = max_steps * self.eval_multiplier
+        
+        # # Evaluate the policy without randomness
+        # scores = []
+        # for i in range(episodes):
+        #     state, info = self.env.reset()
+            
+        #     done = False
+        #     score = 0
+        #     steps_taken = 0
+        #     while not done:
+        #     #for _ in range(self.max_steps*self.eval_multiplier):
+        #         policy, _ = self.predict(torch.tensor(state, dtype=torch.float32))
+        #         action = torch.argmax(policy).item()
+        #         state, reward, done, truncated, info = self.env.step(action)
+                
+        #         # if info dict is not empty, print info
+        #         if len(info) > 0:
+        #             # Print info in blue
+        #             output = f"\t\033[94mInfo: {info}\033[00m"
+                
+        #         if truncated:
+        #             done = True
+        #             reward += self.truncated_reward
 
-                score += reward
+        #         score += reward
+        #         steps_taken += 1
                 
-                if done:
-                    break
+        #         if done:
+        #             print(f"\tEval reward: {score:.2f}, steps taken: {steps_taken}")
+        #             break
                 
-            scores.append(score)
+        #     scores.append(score)
+        
+        # Create a vectorized environment
+        envs = SyncVectorEnv([lambda: self.env] * episodes)
+        
+        # Reset all environments at the start
+        states, infos = envs.reset()
+        
+        # Initialize tracking variables
+        scores = np.zeros(episodes)
+        steps_taken = np.zeros(episodes)
+        dones = np.zeros(episodes, dtype=bool)
+        
+        while not np.all(dones):
+            # Predict actions for all environments, but mask those that are done
+            active_envs = ~dones
+            
+            # Placeholder action for done environments
+            actions = np.zeros(episodes, dtype=int)  # Default action for inactive envs (e.g., action 0)
+            
+            if np.any(active_envs):  # Ensure there are active environments
+                policies, _ = self.predict(torch.tensor(states[active_envs], dtype=torch.float32))
+                actions[active_envs] = torch.argmax(policies, dim=1).numpy()  # Only predict for active envs
+                
+            # Step the environments with actions for all envs
+            next_states, rewards, done_flags, truncated_flags, infos = envs.step(actions)
+            
+            # Update scores for environments that aren't done
+            scores[active_envs] += rewards[active_envs]
+            steps_taken[active_envs] += 1
+            
+            # Update the 'done' flags
+            dones[active_envs] = done_flags[active_envs] | truncated_flags[active_envs]
+
+        # Print evaluation results for environments that are done
+        for i in range(episodes):
+            if dones[i]:
+                print(f"\t - Env {i}: reward = {scores[i]:.2f}, steps taken = {steps_taken[i]}")
+    
+        # Calculate average score
+        avg_score = np.mean(scores)
+        
+        # Close the environments
+        envs.close()
+        
+        # Reset the max steps
+        self.env.spec.max_episode_steps = max_steps 
             
         return np.mean(scores)
                 
@@ -311,6 +393,9 @@ class PPOWrapper:
         return series
             
     def checkpoint(self, eval_reward, episode, total_epochs):
+        # TODO nothing here works
+        
+        # TODO move this calculation
         # Update the moving average
         self.eval_ma *= self.ma_factor
         self.eval_ma += (1 - self.ma_factor) * eval_reward
@@ -323,7 +408,7 @@ class PPOWrapper:
     
         if self.max_eval_ma == 0:
             # Print in blue
-            output = "\033[94mFirst checkpoint\033[00m"
+            output = f"\033[94mFirst checkpoint, eval ma: {self.eval_ma}\033[00m"
             print(output)
             self.max_eval_ma = self.eval_ma
             
@@ -332,9 +417,12 @@ class PPOWrapper:
             ratio = 0
         else:
             ratio = self.eval_ma / self.max_eval_ma
+            if self.eval_ma < 0:
+                ratio = 1/ratio
         
         # Saving logic
-        if ratio > self.ma_save_ratio and self.eval_ma > self.max_eval_ma:
+        #if ratio > self.ma_save_ratio and self.eval_ma > self.max_eval_ma:
+        if self.eval_ma > self.max_eval_ma:
             # Update the maximum evaluation moving average
             self.max_eval_ma = self.eval_ma
             self.latest_checkpoint_episode = episode
@@ -361,9 +449,8 @@ class PPOWrapper:
         # Calculate the spacing    
         episode_spacing = episode - self.latest_checkpoint_episode
         
-        if self.checkpoint_path == None:
+        if self.model_save == None:
             return
-        
         try:             
             # Restore logic
             if ratio < self.ma_load_ratio and episode_spacing > self.minimum_episode_spacing:
