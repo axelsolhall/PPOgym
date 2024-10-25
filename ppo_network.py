@@ -1,10 +1,11 @@
 import torch
 from torch import nn, optim
+from torch.nn import functional as F
 
 class PPONetwork(nn.Module):
     def __init__(self, *args, **kwargs):
         super(PPONetwork, self).__init__()
-        self.input_dim = kwargs.get("input_dim")
+        self.input_dims = kwargs.get("input_dims", None)
 
         self.shared_hidden_dims = kwargs.get("shared_hidden_dims")
         self.shared_norm = kwargs.get("shared_norm", None)
@@ -15,22 +16,28 @@ class PPONetwork(nn.Module):
         self.value_hidden_dims = kwargs.get("value_hidden_dims")
         self.value_norm = kwargs.get("value_norm", None)
 
-        self.output_dim = kwargs.get("output_dim")
+        self.output_dims = kwargs.get("output_dims", None)
+        
+        self.activation = kwargs.get("activation", None)
+        
+        assert self.input_dims != None, "Input dimensions must be provided"
+        assert self.output_dims != None, "Output dimensions must be provided"
+        assert self.activation != None, "Activation function must be provided"
 
         # Shared layers
         self.shared_layers = self.build_layers(
-            self.input_dim, self.hidden_dims, self.shared_norm
+            self.input_dims, self.shared_hidden_dims, self.shared_norm
         )
 
         # Policy head layers
         self.policy_layers = self.build_layers(
-            self.hidden_dims[-1], self.policy_hidden_dims, self.policy_norm
+            self.shared_hidden_dims[-1], self.policy_hidden_dims, self.policy_norm
         )
-        self.policy_output = nn.Linear(self.policy_hidden_dims[-1], self.output_dim)
+        self.policy_output = nn.Linear(self.policy_hidden_dims[-1], self.output_dims)
 
         # Value head layers
         self.value_layers = self.build_layers(
-            self.hidden_dims[-1], self.value_hidden_dims, self.value_norm
+            self.shared_hidden_dims[-1], self.value_hidden_dims, self.value_norm
         )
         self.value_output = nn.Linear(self.value_hidden_dims[-1], 1)
 
@@ -43,7 +50,7 @@ class PPONetwork(nn.Module):
             layers.append(nn.Linear(input_size, dim))
             if normalize != None:
                 layers.append(normalize(dim))
-            layers.append(nn.ReLU())
+            layers.append(self.activation())
             input_size = dim
         return nn.Sequential(*layers)
 
