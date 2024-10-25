@@ -59,7 +59,7 @@ class PPOWrapper:
                 param_group["lr"] = self.lr
 
             if self.debug_prints:
-                print(f"Current learning rate: {lr}")
+                print(f"Current learning rate: {self.lr}")
 
         # Linearly anneal the clip epsilon
         if self.final_clip_eps is not None:
@@ -200,6 +200,7 @@ class PPOWrapper:
         return np.mean(scores)
 
     def train(self, generations):
+        evolution = np.zeros(generations)
         for generation in range(generations):
 
             # Collect trajectories
@@ -216,7 +217,7 @@ class PPOWrapper:
                 # Shuffle data
                 if self.batch_shuffle:
                     indices = torch.randperm(self.iterations)
-                    
+
                     states = states[indices]
                     actions = actions[indices]
                     log_probs = log_probs[indices]
@@ -273,7 +274,11 @@ class PPOWrapper:
 
             # Evaluate
             eval_reward = self.evaluate()
-            print(f"Generation {generation} - Reward: {eval_reward}")
+            evolution[generation] = eval_reward
+            if self.debug_prints:
+                print(f"Generation {generation} - Reward: {eval_reward}")
 
             # Parameter scheduler
             self.parameter_scheduler(generation, generations)
+
+        return np.round(evolution, 2)
