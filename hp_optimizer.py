@@ -14,7 +14,7 @@ from concurrent.futures import as_completed
 import cv2
 
 # Miscellanous imports
-import uuid, warnings, os
+import uuid, warnings, os, json
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -64,6 +64,9 @@ class HPOptimizer:
         self.ppo_class = ppo_class
         self.ppo_kwargs = ppo_kwargs
 
+        self.save_file_folder = f"hp_tuning_models"
+        self.save_file_name = f"hp_tuning_log.json"  # _{str(uuid.uuid4())[:8]}.json"
+
     def run_parallel(self, generations, num_threads):
         evolutions = np.zeros((num_threads, generations))
         futures = []
@@ -109,9 +112,11 @@ class HPOptimizer:
         return conc_threads_sequence
 
     def run_trials(self, generations, num_trials, max_threads=8):
+        # Distribute threads
         multi_thread_sequence = self.distribute_threads(num_trials, max_threads)
         evolutions = np.zeros((num_trials, generations))
 
+        # Run trials, up to max_threads at a time
         offset = 0
         for i, threads in enumerate(multi_thread_sequence):
             evos = self.run_parallel(generations, threads)
@@ -134,6 +139,8 @@ class HPOptimizer:
         y_label="Reward",
         y_label2="Comulative Score",
     ):
+
+        # Set up the plot
         plt.figure(figsize=(10, 5))
         plt.title(title)
         plt.xlabel(x_label)
@@ -159,12 +166,99 @@ class HPOptimizer:
 
         plt.show()
 
-    def optimize_hyperparameters(self, parameters, generations, num_trials=1):
-        parameter_idx = 0
-        no_change_idx = np.zeros(len(parameters))
+    def make_serializable(self, kwargs):
+        # Convert the kwargs to a serializable format
+        serializable_kwargs = {}
+        for k, v in kwargs.items():
+            if isinstance(v, (int, float, str, bool, list, dict)):
+                serializable_kwargs[k] = v
+            elif isinstance(v, type):  # Handle class types like nn.LayerNorm, nn.ReLU
+                serializable_kwargs[k] = v.__name__  # Use the class name as a string
+            else:
+                serializable_kwargs[k] = str(
+                    v
+                )  # Convert other unsupported types to strings
+        return serializable_kwargs
 
-        while True:
-            p = parameters[parameter_idx]
+    def log_results_for_hp(self, mean, std, score, final_score, generations):
+        # Ensure the results folder exists
+        if not os.path.exists(self.save_file_folder):
+            os.makedirs(self.save_file_folder)
+
+        # Define the path for saving the results
+        path = f"{self.save_file_folder}/{self.save_file_name}"
+
+        # Create the results file if it doesn't exist
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                json.dump({}, f)
+
+        # Create a unique key from the network and PPO kwargs
+        key = json.dumps(
+            {
+                **self.make_serializable(self.network_kwargs),
+                **self.make_serializable(self.ppo_kwargs),
+                "generations": generations,
+            },
+            sort_keys=True,
+        )
+
+        # Load existing results
+        with open(path, "r") as f:
+            results = json.load(f)
+
+        # Add new score if the configuration hasn’t been logged
+        results[key] = {
+            "mean": [round(m, 2) for m in mean.tolist()],
+            "std": [round(s, 2) for s in std.tolist()],
+            "score": [round(sc, 2) for sc in score.tolist()],
+            "final_score": round(final_score, 2),
+        }
+
+        # Write updated results back to the file
+        with open(path, "w") as f:
+            json.dump(results, f, indent=4, separators=(", ", ": "), sort_keys=True)
+
+    def check_results_for_hp(self, generations):
+        # Define the path for the results file
+        path = f"{self.save_file_folder}/{self.save_file_name}"
+
+        # Return None if the file does not exist
+        if not os.path.exists(path):
+            return None
+
+        # Create a unique key from the network and PPO kwargs
+        key = json.dumps(
+            {
+                **self.make_serializable(self.network_kwargs),
+                **self.make_serializable(self.ppo_kwargs),
+                "generations": generations,
+            },
+            sort_keys=True,
+        )
+
+        # Load the results
+        with open(path, "r") as f:
+            results = json.load(f)
+
+        # Return the score if the key exists, otherwise None
+        if key in results:
+            data = results[key]
+            mean = data["mean"]
+            std = data["std"]
+            score = data["score"]
+            final_score = data["final_score"]
+            return mean, std, score, final_score
+        else:
+            return None
+
+    def sweep_values(self, p):
+        # Handle provided values
+        if isinstance(p, tuple):
+            p, p_vals = p
+
+        # Dynamic values
+        else:
             p_val = self.ppo_kwargs[p]
             p_dtype = type(p_val)
 
@@ -178,36 +272,79 @@ class HPOptimizer:
                 ]
             elif p_dtype == float or p_dtype == np.float64:
                 p_vals = [p_val / scaler, p_val, p_val * scaler]
+                p_vals = [np.round(pv, 4) for pv in p_vals]
 
             elif p_dtype == bool or p_dtype == np.bool_:
-                p_vals = [not p_val, p_val]
+                p_vals = [p_val, not p_val]
 
             else:
                 raise ValueError(f"Unsupported data type {p_dtype}")
 
-            print(f"Optimizing {p} with values {p_vals}")
+        return p, p_vals
 
-            # Run trials for each value
+    def optimize_hyperparameters(self, parameters, generations, num_trials=1):
+        parameter_idx = 0
+        no_change_idx = np.zeros(len(parameters))
+
+        while True:
+            p = parameters[parameter_idx]
+            
+            p, p_vals = self.sweep_values(p)
+
+            print(f"Optimizing {p} with values: {p_vals}")
+
+            p_val_before = self.ppo_kwargs[p]
+
+            # Pre-allocate storage
             serieses_mean = np.zeros((len(p_vals), generations))
             serieses_std = np.zeros((len(p_vals), generations))
-            series_score = np.zeros((len(p_vals), generations))
+            serieses_score = np.zeros((len(p_vals), generations))
+            final_score = np.zeros(len(p_vals))
+            
+            # Run trials for each value
             for i, pv in enumerate(p_vals):
-                # TODO: check if run has already beed done
 
+                #  Update the parameter
                 self.ppo_kwargs[p] = pv
+
+                # Check if the results are already logged ...
+                score_load = self.check_results_for_hp(generations)
+                if score_load is not None:
+                    mean, std, score, final_score_value = score_load
+                    print(f"Skipping {p} = {pv}, score: {final_score_value:.2f}")
+                    
+                    # Store the results
+                    serieses_mean[i] = mean
+                    serieses_std[i] = std
+                    serieses_score[i] = score
+                    final_score[i] = final_score_value
+
+                    # Move to the next parameter
+                    continue
+
+
+                # ... else run trials for those values
+                print(f"Running trials for {p} = {pv}")
+
                 series = self.run_trials(generations, num_trials)
                 serieses_mean[i] = np.mean(series, axis=0)
                 serieses_std[i] = np.std(series, axis=0)
-                # Score is mean - std/2
-                # Want high mean and low std
-                series_score[i] = (
+                serieses_score[i] = (  # Score is mean - std/2
                     serieses_mean[i] - serieses_std[i] * 0.5  #! MAGIC NUMBER
+                ) # TODO: Maybe sqrt(std) instead of std/2
+                final_score[i] = np.sum(serieses_score[i])
+
+                # Log the results
+                self.log_results_for_hp(
+                    serieses_mean[i],
+                    serieses_std[i],
+                    serieses_score[i],
+                    final_score[i],
+                    generations,
                 )
 
-                # TODO: save the results, ppo_kwargs as key
-
             # Find the best value
-            best_idx = np.argmax(np.sum(series_score, axis=1))
+            best_idx = np.argmax(final_score)
 
             # Update the parameter
             self.ppo_kwargs[p] = p_vals[best_idx]
@@ -216,7 +353,7 @@ class HPOptimizer:
             print(f"Best value for {p}: {p_vals[best_idx]}")
 
             # Check for change
-            if best_idx == 1:
+            if p_vals[best_idx] == p_val_before:
                 no_change_idx[parameter_idx] = 1
                 print(
                     f"No change in {p}, no change ratio: {np.round(sum(no_change_idx)/len(parameters), 2)}"
@@ -228,9 +365,12 @@ class HPOptimizer:
             self.plot_series(
                 serieses_mean,
                 serieses_std,
-                series_score,
+                serieses_score,
                 title=f"Optimizing: {p}",
-                legend=[str(np.round(pv, 4)) for pv in p_vals],
+                legend=[
+                    str(pv) if isinstance(pv, bool) else str(np.round(pv, 4))
+                    for pv in p_vals
+                ],
             )
 
             # Check if we should stop
@@ -295,7 +435,7 @@ class HPOptimizer:
 
         # Run the evolution
         ppo_instance.train(
-            generations=generations_sequence[-1]+1,
+            generations=generations_sequence[-1] + 1,
             save_folder=save_folder,
             save_sequence=generations_sequence,
         )
@@ -356,7 +496,6 @@ class HPOptimizer:
                 frame = self.process_frame(frame, text=f"Generation: {gen}")
                 video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
-
         # Release video writer and environment
         video_writer.release()
         env_single.close()
@@ -364,7 +503,7 @@ class HPOptimizer:
         # Print the video filename
         print(f"Video saved to {video_path}")
 
-        # Delete the save folder if video folder is provided
+        # Delete the save folder if not keeping models
         if not keep_models:
             files = os.listdir(save_folder)
             for f in files:

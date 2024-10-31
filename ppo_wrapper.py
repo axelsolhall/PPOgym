@@ -3,6 +3,32 @@ from torch import nn, optim
 import numpy as np
 
 
+class MovingAverageNormalizer:
+    def __init__(self, decay=0.99, use_torch=True):
+        self.mean = 0.0
+        self.var = 1.0
+        self.decay = decay
+        self.use_torch = use_torch  # Flag to specify PyTorch or NumPy
+
+    def update(self, x):
+        if self.use_torch:
+            batch_mean = x.mean()
+            batch_var = x.var()
+        else:
+            batch_mean = np.mean(x)
+            batch_var = np.var(x)
+
+        # Moving averages for mean and variance
+        self.mean = self.decay * self.mean + (1 - self.decay) * batch_mean
+        self.var = self.decay * self.var + (1 - self.decay) * batch_var
+
+    def normalize(self, x):
+        if self.use_torch:
+            return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
+        else:
+            return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
 class PPOWrapper:
     def __init__(self, envs, network, *args, **kwargs):
         # Environments vector
@@ -32,25 +58,42 @@ class PPOWrapper:
         assert self.value_coef != None, "Value coefficient must be provided"
         assert self.entropy_coef != None, "Entropy coefficient must be provided"
 
+        # Reward normalization
+        self.reward_normalize = kwargs.get("reward_normalize", False)
+        self.reward_normalizer = MovingAverageNormalizer()
+
         # Batch parameters
         self.batch_size = kwargs.get("batch_size", None)
         self.batch_epochs = kwargs.get("batch_epochs", None)
         self.batch_shuffle = kwargs.get("batch_shuffle", False)
         self.iterations = kwargs.get("iterations", None)
+        self.seperate_envs_shuffle = kwargs.get("seperate_envs_shuffle", False)
 
         assert self.batch_size != None, "Batch size must be provided"
         assert self.batch_epochs != None, "Batch epochs must be provided"
         assert self.iterations != None, "Iterations must be provided"
+        assert (
+            self.seperate_envs_shuffle != None
+        ), "Seperate envs shuffle must be provided"
 
         # Checkpointing
         self.checkpointing = kwargs.get("checkpointing", False)
         self.checkpoint_folder = kwargs.get("checkpoint_folder", "checkpoints")
 
+        # TOOD: class for MA
         self.eval_ma_max = -np.inf
         self.eval_ma = None
-        self.eval_ma_alpha = 0.8 #! MAGIC NUMBER
-        self.grace_period = 0.1 #! MAGIC NUMBER
-        self.load_ratio = 0.9 #! MAGIC NUMBER
+        self.eval_ma_alpha = 0.8  #! MAGIC NUMBER
+        self.grace_period = 0.1  #! MAGIC NUMBER
+        self.load_ratio = 0.9  #! MAGIC NUMBER
+
+        # Use CUDA > MPS > CPU
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else
+            "mps" if torch.backends.mps.is_available() else
+            "cpu"
+        )
+        self.network.to(self.device)
 
         # Miscellaneous
         self.truncated_reward = kwargs.get("truncated_reward", 0)
@@ -145,12 +188,20 @@ class PPOWrapper:
         return states, actions, log_probs, rewards, dones, truncateds, values
 
     def compute_advantages(self, rewards, dones, truncateds, values):
+        # Normalize rewards
+        if self.reward_normalize:
+            self.reward_normalizer.update(rewards)
+            rewards = self.reward_normalizer.normalize(rewards)
+
+        # Initialize storage
         advantages = torch.zeros_like(rewards, dtype=torch.float32)
         returns = torch.zeros_like(rewards, dtype=torch.float32)
         gaes = torch.zeros(self.num_envs, dtype=torch.float32)
 
+        # Add a zero value at the end
         values = torch.cat((values, torch.zeros((1, self.num_envs))), dim=0)
 
+        # Compute advantages and returns
         for ti in reversed(range(rewards.size(0))):
 
             next_values = values[ti + 1]
@@ -171,37 +222,49 @@ class PPOWrapper:
         return advantages, returns
 
     def evaluate(self):
+        # Pre-allocate storage
         scores_w_trunc_rew = np.zeros(self.num_envs)
         scores_wo_trunc_rew = np.zeros(self.num_envs)
         alive = np.ones(self.num_envs)
 
+        # Reset environments
         current_states, infos = self.envs.reset()
 
+        # Iterate through iterations
         for itr in range(self.iterations):
+            # Get policies, no need for values
             states_tensor = torch.tensor(current_states, dtype=torch.float32)
             policies, _ = self.network(states_tensor)
 
+            # Argmax because we are in evaluation mode
             actions = torch.argmax(policies, dim=-1)
 
+            # Step through environments
             next_states, current_rewards, current_dones, current_truncateds, infos = (
                 self.envs.step(actions.numpy())
             )
 
+            # Add truncated rewards
             current_rewards_w_trunc = current_rewards.copy()
             if current_truncateds.any():
                 current_rewards_w_trunc += current_truncateds * self.truncated_reward
                 current_dones = current_dones | current_truncateds
 
+            # Break if all environments are done
             if not alive.any():
                 break
 
+            # Update states
             current_states = next_states
 
+            # Update scores, w and w/o truncated rewards
             scores_w_trunc_rew += current_rewards_w_trunc * alive
             scores_wo_trunc_rew += current_rewards * alive
 
+            # Kill environments that are done
             alive[current_dones] = 0
 
+        # Return the mean scores, w and w/o truncated rewards
         return np.mean(scores_w_trunc_rew), np.mean(scores_wo_trunc_rew)
 
     def save(self, path):
@@ -248,15 +311,17 @@ class PPOWrapper:
             if self.debug_prints:
                 print(f"Checkpointing best model with reward: {self.eval_ma_max}")
 
-        # Load the best checkpoint
+        # Load if moving average is below threshold ...
         cond0 = self.eval_ma < (
             self.eval_ma_max / self.load_ratio
             if self.eval_ma < 0
             else self.eval_ma_max * self.load_ratio
         )
+        # ... and grace period is met
         cond1 = gen > self.last_checkpoint + self.grace_period * total_gens
 
         if cond0 and cond1:
+            # Try in case of non-existing checkpoint
             try:
                 self.load(self.best_checkpoint)
                 if self.debug_prints:
@@ -265,7 +330,10 @@ class PPOWrapper:
                 print(f"Error loading best checkpoint: {e}")
 
     def train(self, generations, save_folder=None, save_sequence=None):
+        # Pre-allocate storage
         evolution = np.zeros(generations)
+
+        # Iterate through generations
         for generation in range(generations):
 
             # Collect trajectories
@@ -281,37 +349,30 @@ class PPOWrapper:
             for epoch in range(self.batch_epochs):
                 # Shuffle data
                 if self.batch_shuffle:
-                    # indices = torch.randperm(self.iterations)
+                    if self.seperate_envs_shuffle:
+                        # Shuffle along the sequence dimension for each environment
+                        for env in range(states.size(1)):
+                            env_indices = torch.randperm(states.size(0))
 
-                    # print(f"States shape: {states.shape}")
-                    # print(f"Actions shape: {actions.shape}")
-                    # print(f"Log probs shape: {log_probs.shape}")
-                    # print(f"Advantages shape: {advantages.shape}")
-                    # print(f"Returns shape: {returns.shape}")
+                            # Apply shuffling for each environment independently along the sequence dimension
+                            states[:, env, :] = states[env_indices, env, :]
+                            actions[:, env] = actions[env_indices, env]
+                            log_probs[:, env] = log_probs[env_indices, env]
+                            advantages[:, env] = advantages[env_indices, env]
+                            returns[:, env] = returns[env_indices, env]
+                    else:
+                        # Shuffle along the sequence dimension
+                        indices = torch.randperm(self.iterations)
 
-                    # return
-
-                    # states = states[indices]
-                    # actions = actions[indices]
-                    # log_probs = log_probs[indices]
-                    # advantages = advantages[indices]
-                    # returns = returns[indices]
-
-                    # TODO: Check if this is correct
-                    for env in range(states.size(1)):  # 16 environments
-                        env_indices = torch.randperm(
-                            states.size(0)
-                        )  # Shuffle along the 2048 steps
-
-                        # Apply shuffling for each environment independently along the sequence dimension
-                        states[:, env, :] = states[env_indices, env, :]
-                        actions[:, env] = actions[env_indices, env]
-                        log_probs[:, env] = log_probs[env_indices, env]
-                        advantages[:, env] = advantages[env_indices, env]
-                        returns[:, env] = returns[env_indices, env]
+                        states = states[indices]
+                        actions = actions[indices]
+                        log_probs = log_probs[indices]
+                        advantages = advantages[indices]
+                        returns = returns[indices]
 
                 # Iterate through batches
                 for start in range(0, len(states), self.batch_size):
+                    # Get batch
                     end = start + self.batch_size
 
                     batch_states = states[start:end]
@@ -325,6 +386,7 @@ class PPOWrapper:
                     new_action_dist = torch.distributions.Categorical(new_policies)
                     new_log_probs = new_action_dist.log_prob(batch_actions)
 
+                    # Check if new_values is a scalar
                     if new_values.shape != batch_returns.shape:
                         new_values = new_values.squeeze(-1)
 
@@ -366,13 +428,14 @@ class PPOWrapper:
 
             # Evaluate
             eval_reward_w_trunc, eval_reward_wo_trunc = self.evaluate()
+            # Store the evaluation reward without truncated rewards ...
+            # ... because trunc. rewards are artifical
             evolution[generation] = eval_reward_wo_trunc
             if self.debug_prints:
                 # TODO: Add a logger instead of print
                 pass
-
             print(
-                f"Generation {generation}\t- Reward: {eval_reward_w_trunc:.2f},\tw/o trunc.: {eval_reward_wo_trunc:.2f}"
+                f"Generation {generation:>4} - Reward: {eval_reward_w_trunc:8.2f}, w/o trunc.: {eval_reward_wo_trunc:8.2f}"
             )
 
             # Checkpointing

@@ -2,6 +2,7 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 
+
 class PPONetwork(nn.Module):
     def __init__(self, *args, **kwargs):
         super(PPONetwork, self).__init__()
@@ -17,9 +18,9 @@ class PPONetwork(nn.Module):
         self.value_norm = kwargs.get("value_norm", None)
 
         self.output_dims = kwargs.get("output_dims", None)
-        
+
         self.activation = kwargs.get("activation", None)
-        
+
         assert self.input_dims != None, "Input dimensions must be provided"
         assert self.output_dims != None, "Output dimensions must be provided"
         assert self.activation != None, "Activation function must be provided"
@@ -55,10 +56,11 @@ class PPONetwork(nn.Module):
         return nn.Sequential(*layers)
 
     def he_initialization(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+        if self.activation == nn.ReLU:
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, x):
         # Pass through shared layers
