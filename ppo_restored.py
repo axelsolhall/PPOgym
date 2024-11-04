@@ -93,12 +93,11 @@ class PPOWrapper:
         #     if torch.cuda.is_available()
         #     else "mps" if torch.backends.mps.is_available() else "cpu"
         # )
-        #self.network.to(self.device)
+        # self.network.to(self.device)
         # Print what device is being used
         # print(f"Network using: {next(self.network.parameters()).device}")
         # return
-              
-                            
+
         # Miscellaneous
         self.truncated_reward = kwargs.get("truncated_reward", 0)
         self.checkpointing = kwargs.get("checkpointing", False)
@@ -284,7 +283,7 @@ class PPOWrapper:
             next_states, current_rewards, current_dones, current_truncateds, infos = (
                 # & MPS
                 self.envs.step(actions.numpy())
-                #self.envs.step(actions.cpu().numpy())
+                # self.envs.step(actions.cpu().numpy())
             )
 
             # Add truncated rewards

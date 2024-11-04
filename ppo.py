@@ -1,674 +1,502 @@
-import torch,  time, os, json, gym, warnings
-import numpy as np
-import matplotlib.pyplot as plt
+import torch
 from torch import nn, optim
-import torch.nn.functional as F
-#from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures import as_completed
-from gym.vector import SyncVectorEnv
-
-class PPONetwork(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(PPONetwork, self).__init__()
-        self.input_dim = kwargs.get("input_dim")
-        self.output_dim = kwargs.get("output_dim")
-        self.hidden_dims = kwargs.get("hidden_dims")
-        self.policy_hidden_dims = kwargs.get("policy_hidden_dims")
-        self.value_hidden_dims = kwargs.get("value_hidden_dims")
-        
-        self.shared_layers = self.build_layers(self.input_dim, self.hidden_dims, normalize=True)
-        
-        # Policy head layers
-        self.policy_layers = self.build_layers(self.hidden_dims[-1], self.policy_hidden_dims, normalize=True)
-        self.policy_output = nn.Linear(self.policy_hidden_dims[-1], self.output_dim)
-        
-        # Value head layers
-        self.value_layers = self.build_layers(self.hidden_dims[-1], self.value_hidden_dims, normalize=True)
-        self.value_output = nn.Linear(self.value_hidden_dims[-1], 1)
-        
-        # Apply He initialization to the layers
-        self.apply(self.he_initialization)
-    
-    def build_layers(self, input_size, layer_dims, normalize=False):
-        layers = []
-        for dim in layer_dims:
-            layers.append(nn.Linear(input_size, dim))
-            if normalize:
-                layers.append(nn.LayerNorm(dim)) 
-            layers.append(nn.ReLU())
-            #layers.append(nn.LeakyReLU())
-            input_size = dim  # Set input size to the output of the last layer
-        return nn.Sequential(*layers)  # Return the layers as a sequential model
-
-    def he_initialization(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.kaiming_normal_(module.weight, nonlinearity='relu')  # He initialization
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)  # Initialize bias as zeros
-
-    def forward(self, x):
-        # Pass through shared layers
-        x = self.shared_layers(x)
-        
-        # Policy head
-        policy_x = self.policy_layers(x)
-        policy = F.softmax(self.policy_output(policy_x), dim=-1)
-        
-        # Value head
-        value_x = self.value_layers(x)
-        value = self.value_output(value_x)
-        
-        return policy, value
+import numpy as np
 
 
-class PPOWrapper:
-    def __init__(self, env, network, *args, **kwargs):
-        self.env = env
+class MovingAverageNormalizer:
+    def __init__(self, decay=0.99, use_torch=True):
+        self.mean = 0.0
+        self.var = 1.0
+        self.decay = decay
+        self.use_torch = use_torch  # Flag to specify PyTorch or NumPy
+
+    def update(self, x):
+        if self.use_torch:
+            batch_mean = x.mean()
+            batch_var = x.var()
+        else:
+            batch_mean = np.mean(x)
+            batch_var = np.var(x)
+
+        # Moving averages for mean and variance
+        self.mean = self.decay * self.mean + (1 - self.decay) * batch_mean
+        self.var = self.decay * self.var + (1 - self.decay) * batch_var
+
+    def normalize(self, x):
+        if self.use_torch:
+            return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
+        else:
+            return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+
+
+class PPOBase:
+    def __init__(self, envs, network, *args, **kwargs):
+        # Environments vector
+        self.envs = envs
+        self.num_envs = kwargs.get("num_envs", 1)
+
+        # Network
         self.network = network
-        self.gamma = kwargs.get("gamma")
-        self.lam = kwargs.get("lam")
-        self.clip = kwargs.get("clip_epsilon")
-        self.initial_lr = kwargs.get("initial_lr")
-        self.final_lr = kwargs.get("final_lr")
-        self.value_coef = kwargs.get("value_coef")
-        self.entropy_coef = kwargs.get("entropy_coef")
-        self.batch_size = kwargs.get("batch_size")
-        self.batch_epochs = kwargs.get("batch_epochs")
-        self.batch_shuffle = kwargs.get("batch_shuffle")
-        self.checkpointing = kwargs.get("checkpointing")
-        
-        # Episode parameters # TODO: remove this logic
-        self.truncated_reward = kwargs.get("truncated_reward")
-        self.episode_steps = 1500 # Maximum step to start an new episode
-        self.max_steps = 100000 # Maximum number of steps per episode
-        self.eval_multiplier = 1 # Evaluate the policy for 5 times the number of steps
+        self.lr = kwargs.get("lr", None)
+        self.final_lr = kwargs.get("final_lr", None)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
 
-        # Optimizer
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.initial_lr)
-        
-        # Annealing
-        self.anneal_clip = kwargs.get("anneal_clip")
-        self.initial_clip = None
-        self.anneal_entropy = kwargs.get("anneal_entropy")
-        self.initial_entropy = None
-        self.anneal_lambda = kwargs.get("anneal_lambda")
-        self.initial_lambda = None
-        
-        # Checkpointing    
-        self.checkpoint_path = "checkpoints"   
-        self.ma_factor = 0.9
-        self.ma_save_ratio = 1.05
-        self.ma_load_ratio = 0.75
-        self.minimum_episode_spacing = 50
-        
-        self.eval_ma = 0
-        self.max_eval_ma = 0
-        self.checkpoint_grace = 0.001
-        self.latest_checkpoint_episode = 0
-        self.model_save = None
-        self.optimizer_save = None
-        self.ma_save = None
-        
-        #Statistics
-        self.avg_lifetime = None
-        
-    def predict(self, state):
-        return self.network(state)
-    
-    def compute_advantages(self, rewards, dones, values):
+        assert self.lr != None, "Learning rate must be provided"
+
+        # PPO parameters
+        self.gamma = kwargs.get("gamma", None)
+        self.lam = kwargs.get("lam", None)
+        self.clip_eps = kwargs.get("clip_eps", None)
+        self.final_clip_eps = kwargs.get("final_clip_eps", None)
+        self.value_coef = kwargs.get("value_coef", None)
+        self.entropy_coef = kwargs.get("entropy_coef", None)
+        self.final_entropy_coef = kwargs.get("final_entropy_coef", None)
+
+        assert self.gamma != None, "Gamma must be provided"
+        assert self.lam != None, "Lambda must be provided"
+        assert self.clip_eps != None, "Clip epsilon must be provided"
+        assert self.value_coef != None, "Value coefficient must be provided"
+        assert self.entropy_coef != None, "Entropy coefficient must be provided"
+
+        # Reward normalization
+        self.reward_normalize = kwargs.get("reward_normalize", False)
+        self.reward_normalizer = MovingAverageNormalizer()
+
+        # Batch parameters
+        self.batch_size = kwargs.get("batch_size", None)
+        self.batch_epochs = kwargs.get("batch_epochs", None)
+        self.batch_shuffle = kwargs.get("batch_shuffle", False)
+        self.iterations = kwargs.get("iterations", None)
+        self.seperate_envs_shuffle = kwargs.get("seperate_envs_shuffle", False)
+
+        assert self.batch_size != None, "Batch size must be provided"
+        assert self.batch_epochs != None, "Batch epochs must be provided"
+        assert self.iterations != None, "Iterations must be provided"
+        assert (
+            self.seperate_envs_shuffle != None
+        ), "Seperate envs shuffle must be provided"
+
+        # Checkpointing
+        self.checkpointing = kwargs.get("checkpointing", False)
+        self.checkpoint_folder = kwargs.get("checkpoint_folder", "checkpoints")
+
+        # TODO: class for MA
+        self.eval_ma_max = -np.inf
+        self.eval_ma = None
+        self.eval_ma_alpha = 0.8  #! MAGIC NUMBER
+        self.grace_period = 0.1  #! MAGIC NUMBER
+        self.load_ratio = 0.9  #! MAGIC NUMBER
+
+        # Miscellaneous
+        self.truncated_reward = kwargs.get("truncated_reward", 0)
+        self.checkpointing = kwargs.get("checkpointing", False)
+        self.debug_prints = kwargs.get("debug_prints", False)
+
+    def parameter_scheduler(self, gen, total_gens):
+        # Linearly anneal the learning rate
+        if self.final_lr is not None:
+            if not hasattr(self, "initial_lr"):
+                self.initial_lr = self.lr
+
+            alpha = gen / total_gens
+            self.lr = self.initial_lr + alpha * (self.final_lr - self.initial_lr)
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.lr
+
+            if self.debug_prints:
+                print(f"Current learning rate: {self.lr}")
+
+        # Linearly anneal the clip epsilon
+        if self.final_clip_eps is not None:
+            if not hasattr(self, "initial_clip_eps"):
+                self.initial_clip_eps = self.clip_eps
+
+            alpha = gen / total_gens
+            self.clip_eps = self.initial_clip_eps + alpha * (
+                self.final_clip_eps - self.initial_clip_eps
+            )
+
+            if self.debug_prints:
+                print(f"Current clip epsilon: {self.clip_eps}")
+
+        # Linearly anneal the entropy coefficient
+        if self.final_entropy_coef is not None:
+            if not hasattr(self, "initial_entropy_coef"):
+                self.initial_entropy_coef = self.entropy_coef
+
+            alpha = gen / total_gens
+            self.entropy_coef = self.initial_entropy_coef + alpha * (
+                self.final_entropy_coef - self.initial_entropy_coef
+            )
+
+            if self.debug_prints:
+                print(f"Current entropy coefficient: {self.entropy_coef}")
+
+    def collect_trajectories(self):
+
+        # Pre-allocate storage
+        states = torch.zeros(self.iterations, self.num_envs, self.network.input_dims)
+        actions = torch.zeros(self.iterations, self.num_envs, self.actions_dims)
+        log_probs = torch.zeros(self.iterations, self.num_envs)
+        rewards = torch.zeros(self.iterations, self.num_envs)
+        dones = torch.zeros(self.iterations, self.num_envs)
+        truncateds = torch.zeros(self.iterations, self.num_envs)
+        values = torch.zeros(self.iterations, self.num_envs)
+
+        # Reset environments
+        current_states, infos = self.envs.reset()
+        # Iterate through iterations
+        for itr in range(self.iterations):
+            # Convert states to tensor
+            states_tensor = torch.tensor(current_states, dtype=torch.float32)
+
+            # Get actions, log_probs and values
+            current_actions, current_log_probs, current_values, _ = self.forward_pass(
+                states_tensor
+            )
+
+            # Step through environments
+            next_states, current_rewards, current_dones, current_truncateds, infos = (
+                self.envs.step(current_actions.numpy())
+            )
+
+            # Check if current_actions is a scalar
+            # if current_actions.dim() == 1:
+            #     current_actions = current_actions.unsqueeze(-1)
+
+            # Add truncated rewards
+            if current_truncateds.any():
+                current_rewards += current_truncateds * self.truncated_reward
+                current_dones = current_dones | current_truncateds
+
+            current_states = next_states
+
+            # Store data
+            states[itr] = states_tensor
+            actions[itr] = current_actions
+            log_probs[itr] = current_log_probs.detach()
+            rewards[itr] = torch.tensor(current_rewards, dtype=torch.float32)
+            dones[itr] = torch.tensor(current_dones, dtype=torch.float32)
+            truncateds[itr] = torch.tensor(current_truncateds, dtype=torch.float32)
+            values[itr] = current_values.squeeze(-1).detach()
+
+        return states, actions, log_probs, rewards, dones, truncateds, values
+
+    def compute_advantages(self, rewards, dones, truncateds, values):
+        # Normalize rewards
+        if self.reward_normalize:
+            self.reward_normalizer.update(rewards)
+            rewards = self.reward_normalizer.normalize(rewards)
+
+        # Initialize storage
         advantages = torch.zeros_like(rewards, dtype=torch.float32)
         returns = torch.zeros_like(rewards, dtype=torch.float32)
-        gae = 0
+        gaes = torch.zeros(self.num_envs, dtype=torch.float32)
 
-        values = torch.cat((values, torch.tensor([0.0], dtype=torch.float32)))
+        # Add a zero value at the end
+        values = torch.cat((values, torch.zeros((1, self.num_envs))), dim=0)
 
-        for i in reversed(range(len(rewards))):
-            if dones[i]:
-                next_value = 0
-            else:
-                next_value = values[i + 1]
-            
-            delta = rewards[i] + self.gamma * next_value - values[i]
-            gae = delta + self.gamma * self.lam * (1 - dones[i]) * gae
-            advantages[i] = gae
-            returns[i] = gae + values[i]
+        # Compute advantages and returns
+        for ti in reversed(range(rewards.size(0))):
+
+            next_values = values[ti + 1]
+            mask = (dones[ti] + truncateds[ti]) > 0
+            next_values = next_values * (~mask)  # Mask with inverse (~mask)
+
+            deltas = rewards[ti] + self.gamma * next_values - values[ti]
+            gaes = deltas + self.gamma * self.lam * gaes * (1 - dones[ti])
+            advantages[ti] = gaes
+            returns[ti] = gaes + values[ti]
+
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Normalize returns
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         return advantages, returns
 
-    def run_episode(self, steps):
-        states, actions, rewards, log_probs, dones, values = [], [], [], [], [], []
-        avg_lifetime = []
-        while steps > 0:
-            state, info = self.env.reset()
-            lifetime = 0
-            done = False
-            while not done:
-            #for _ in range(self.max_steps):
-                state_tensor = torch.tensor(state, dtype=torch.float32)
-                
-                # Get the policy distribution and value prediction
-                policy, value = self.predict(state_tensor)
-                
-                # Create a categorical distribution from the policy probabilities
-                action_dist = torch.distributions.Categorical(policy)
-                
-                # Sample an action from the distribution
-                action = action_dist.sample().item()
-                
-                # Take the action in the environment
-                next_state, reward, done, truncated, info = self.env.step(action)
-                
-                # Handle truncated logic
-                if truncated:
-                    done = True
-                    reward += self.truncated_reward
-                
-                # Get the log probability of the chosen action
-                log_prob = action_dist.log_prob(torch.tensor(action)).detach()
+    def evaluate(self):
+        # Pre-allocate storage
+        scores_w_trunc_rew = np.zeros(self.num_envs)
+        scores_wo_trunc_rew = np.zeros(self.num_envs)
+        alive = np.ones(self.num_envs)
 
-                states.append(state)
-                actions.append(action)
-                rewards.append(reward)
-                log_probs.append(log_prob)
-                dones.append(done)
-                values.append(value)
+        # Reset environments
+        current_states, infos = self.envs.reset()
 
-                state = next_state
-                
-                steps -= 1
-                lifetime += 1
+        # Iterate through iterations
+        for itr in range(self.iterations):
+            # Get policies, no need for values
+            states_tensor = torch.tensor(current_states, dtype=torch.float32)
+            # policies, _ = self.network(states_tensor)
 
-                if done:
-                    break
-                
-            avg_lifetime.append(lifetime)
-                  
-        self.avg_lifetime = np.mean(avg_lifetime)
+            # # Argmax because we are in evaluation mode
+            # actions = torch.argmax(policies, dim=-1)
+            actions = self.eval_actions(states_tensor)
 
-        return states, actions, rewards, log_probs, dones, values
-    
-    def train(self, states, actions, rewards, old_log_probs, dones, values):
-        states = torch.tensor(np.array(states), dtype=torch.float32)
-        actions = torch.tensor(actions, dtype=torch.int64)
-        rewards = torch.tensor(rewards, dtype=torch.float32)
-        old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32)
-        dones = torch.tensor(dones, dtype=torch.float32)
-        values = torch.tensor(values, dtype=torch.float32)
+            # Step through environments
+            next_states, current_rewards, current_dones, current_truncateds, infos = (
+                self.envs.step(actions.numpy())
+            )
 
-        advantages, returns = self.compute_advantages(rewards, dones, values)
-        
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # TODO: Try normalize the returns
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+            # Add truncated rewards
+            current_rewards_w_trunc = current_rewards.copy()
+            if current_truncateds.any():
+                current_rewards_w_trunc += current_truncateds * self.truncated_reward
+                current_dones = current_dones | current_truncateds
 
-        for _ in range(self.batch_epochs):
-            # Shuffle the data
-            if self.batch_shuffle:
-                indices = np.arange(len(states))
-                np.random.shuffle(indices)
-                
-                states = states[indices]
-                actions = actions[indices]
-                old_log_probs = old_log_probs[indices]
-                advantages = advantages[indices]
-                returns = returns[indices]
-                values = values[indices]
-            
-            for i in range(0, len(states), self.batch_size):
-                batch_states = states[i:i + self.batch_size]
-                batch_actions = actions[i:i + self.batch_size]
-                batch_old_log_probs = old_log_probs[i:i + self.batch_size]
-                batch_advantages = advantages[i:i + self.batch_size]
-                batch_returns = returns[i:i + self.batch_size]
-                batch_values = values[i:i + self.batch_size]
-                
-                # Get new policy and value
-                new_policy_probs, new_value = self.network(batch_states)
-                new_action_dist = torch.distributions.Categorical(new_policy_probs)
-                
-                # Log probability of the action
-                log_probs = new_action_dist.log_prob(batch_actions)
-                #old_log_probs = new_action_dist.log_prob(batch_actions).detach()
-                
-                # Compute the ratio
-                ratio = torch.exp(log_probs - batch_old_log_probs)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1 - self.clip, 1 + self.clip) * batch_advantages
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # Value loss: compare predicted values with returns (rewards-to-go)
-                value_loss = self.value_coef * 0.5 * (batch_returns - new_value.squeeze()).pow(2).mean()
-                
-                # Entropy loss
-                entropy = -torch.sum(new_policy_probs * torch.log(new_policy_probs + 1e-8), dim=-1).mean()
-                entropy_loss = -self.entropy_coef * entropy
-                
-                # Total loss
-                loss = policy_loss + value_loss + entropy_loss
-                
-                # Optimize
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                
-    def adjust_learning_rate(self, current_epoch, total_epochs):
-        # Linearly decay the learning rate
-        new_lr = (self.initial_lr-self.final_lr) * (1 - current_epoch/total_epochs) + self.final_lr
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = new_lr
-            
-        # TODO try exponential decay
-        
-    def anneling(self, current_epoch, total_epochs):
-        # Anneal the clip parameter
-        if self.anneal_clip:
-            if self.initial_clip is None:
-                self.initial_clip = self.clip
-            else:
-                self.clip = self.initial_clip * (1 - current_epoch/total_epochs)
-                
-        # Anneal the entropy coefficient
-        if self.anneal_entropy:
-            if self.initial_entropy is None:
-                self.initial_entropy = self.entropy_coef
-            else:
-                self.entropy_coef = self.initial_entropy * (1 - current_epoch/total_epochs)
-                
-        # Anneal the lambda parameter
-        if self.anneal_lambda:
-            if self.initial_lambda is None:
-                self.initial_lambda = self.lam
-            else:
-                self.lam = self.initial_lambda * (1 - current_epoch/total_epochs)
-    
-    def evaluate_policy(self, episodes):
-        # Increase the max steps for evaluation
-        max_steps = self.env.spec.max_episode_steps
-        self.env.spec.max_episode_steps = max_steps * self.eval_multiplier
-        
-        # # Evaluate the policy without randomness
-        # scores = []
-        # for i in range(episodes):
-        #     state, info = self.env.reset()
-            
-        #     done = False
-        #     score = 0
-        #     steps_taken = 0
-        #     while not done:
-        #     #for _ in range(self.max_steps*self.eval_multiplier):
-        #         policy, _ = self.predict(torch.tensor(state, dtype=torch.float32))
-        #         action = torch.argmax(policy).item()
-        #         state, reward, done, truncated, info = self.env.step(action)
-                
-        #         # if info dict is not empty, print info
-        #         if len(info) > 0:
-        #             # Print info in blue
-        #             output = f"\t\033[94mInfo: {info}\033[00m"
-                
-        #         if truncated:
-        #             done = True
-        #             reward += self.truncated_reward
+            # Break if all environments are done
+            if not alive.any():
+                break
 
-        #         score += reward
-        #         steps_taken += 1
-                
-        #         if done:
-        #             print(f"\tEval reward: {score:.2f}, steps taken: {steps_taken}")
-        #             break
-                
-        #     scores.append(score)
-        
-        # Create a vectorized environment
-        envs = SyncVectorEnv([lambda: self.env] * episodes)
-        
-        # Reset all environments at the start
-        states, infos = envs.reset()
-        
-        # Initialize tracking variables
-        scores = np.zeros(episodes)
-        steps_taken = np.zeros(episodes)
-        dones = np.zeros(episodes, dtype=bool)
-        
-        while not np.all(dones):
-            # Predict actions for all environments, but mask those that are done
-            active_envs = ~dones
-            
-            # Placeholder action for done environments
-            actions = np.zeros(episodes, dtype=int)  # Default action for inactive envs (e.g., action 0)
-            
-            if np.any(active_envs):  # Ensure there are active environments
-                policies, _ = self.predict(torch.tensor(states[active_envs], dtype=torch.float32))
-                actions[active_envs] = torch.argmax(policies, dim=1).numpy()  # Only predict for active envs
-                
-            # Step the environments with actions for all envs
-            next_states, rewards, done_flags, truncated_flags, infos = envs.step(actions)
-            
-            # Update scores for environments that aren't done
-            scores[active_envs] += rewards[active_envs]
-            steps_taken[active_envs] += 1
-            
-            # Update the 'done' flags
-            dones[active_envs] = done_flags[active_envs] | truncated_flags[active_envs]
+            # Update states
+            current_states = next_states
 
-        # Print evaluation results for environments that are done
-        for i in range(episodes):
-            if dones[i]:
-                print(f"\t - Env {i}: reward = {scores[i]:.2f}, steps taken = {steps_taken[i]}")
-    
-        # Calculate average score
-        avg_score = np.mean(scores)
-        
-        # Close the environments
-        envs.close()
-        
-        # Reset the max steps
-        self.env.spec.max_episode_steps = max_steps 
-            
-        return np.mean(scores)
-                
-    def train_model(self, episodes, display=False):
-        series = []
-        for i in range(episodes):
-            # Parameters annealing
-            self.adjust_learning_rate(i, episodes)
-            self.anneling(i, episodes)
-            #print(f"epoch: {i}, clip: {self.clip}, entropy: {self.entropy_coef}, lambda: {self.lam}")
-            
-            # Run an episode
-            states, actions, rewards, log_probs, dones, values = self.run_episode(self.episode_steps)
-            self.train(states, actions, rewards, log_probs, dones, values)
-            
-            # Evaluate the policy
-            eval_reward = self.evaluate_policy(10)
-            series.append(eval_reward)
+            # Update scores, w and w/o truncated rewards
+            scores_w_trunc_rew += current_rewards_w_trunc * alive
+            scores_wo_trunc_rew += current_rewards * alive
 
-            # Checkpointing logic
-            self.checkpoint(eval_reward, i, episodes)
-            
-            if display:
-                print(f"Episode: {i}\t avg life: {self.avg_lifetime:.2f}, eval reward: {eval_reward:.2f}, eval ma: {self.eval_ma:.2f}")
-            
-        return series
-            
-    def checkpoint(self, eval_reward, episode, total_epochs):
-        # TODO nothing here works
-        
-        # TODO move this calculation
-        # Update the moving average
-        self.eval_ma *= self.ma_factor
-        self.eval_ma += (1 - self.ma_factor) * eval_reward
-        
+            # Kill environments that are done
+            alive[current_dones] = 0
+
+        # Return the mean scores, w and w/o truncated rewards
+        return np.mean(scores_w_trunc_rew), np.mean(scores_wo_trunc_rew)
+
+    def save(self, path):
+        # Save the model
+        torch.save(self.network.state_dict(), path)
+
+        # Save the optimizer
+        torch.save(self.optimizer.state_dict(), path + "_optimizer")
+
+    def load(self, path):
+        # Load the model
+        self.network.load_state_dict(torch.load(path))
+
+        # Load the optimizer
+        self.optimizer.load_state_dict(torch.load(path + "_optimizer"))
+
+    def checkpointer(self, eval_reward, gen, total_gens):
+
+        # Update moving average
+        if self.eval_ma is not None:
+            self.eval_ma *= self.eval_ma_alpha
+            self.eval_ma += (1 - self.eval_ma_alpha) * eval_reward
+        else:
+            self.eval_ma = eval_reward
+
+        # If checkpointing is disabled, return
         if not self.checkpointing:
             return
-        
-        if episode < total_epochs * self.checkpoint_grace:
+
+        # If the grace period is not met, return
+        if gen < self.grace_period * total_gens:
             return
-    
-        if self.max_eval_ma == 0:
-            # Print in blue
-            output = f"\033[94mFirst checkpoint, eval ma: {self.eval_ma}\033[00m"
-            print(output)
-            self.max_eval_ma = self.eval_ma
-            
-        # Calculate the ratio
-        if self.max_eval_ma == 0:
-            ratio = 0
-        else:
-            ratio = self.eval_ma / self.max_eval_ma
-            if self.eval_ma < 0:
-                ratio = 1/ratio
-        
-        # Saving logic
-        #if ratio > self.ma_save_ratio and self.eval_ma > self.max_eval_ma:
-        if self.eval_ma > self.max_eval_ma:
-            # Update the maximum evaluation moving average
-            self.max_eval_ma = self.eval_ma
-            self.latest_checkpoint_episode = episode
-            
-            # Save the model and optimizer
-            self.model_save = f"model_{episode}.pth"
-            self.optimizer_save = f"optimizer_{episode}.pth"
-            self.ma_save = f"ma_{episode}.txt"
-            
-            self.save_model(os.path.join(self.checkpoint_path, self.model_save))
-            self.save_optimizer(os.path.join(self.checkpoint_path, self.optimizer_save))
-            with open(os.path.join(self.checkpoint_path, self.ma_save), "w") as f:
-                f.write(str(self.eval_ma))
-                
-            files = os.listdir(self.checkpoint_path)
-            for f in files:
-                if f != self.model_save and f != self.optimizer_save and f != self.ma_save:
-                    os.remove(os.path.join(self.checkpoint_path, f))
-                    
-            # Print in green
-            output = "\033[92mSaved model at episode {}\033[00m".format(episode)
-            print(output)   
-            
-        # Calculate the spacing    
-        episode_spacing = episode - self.latest_checkpoint_episode
-        
-        if self.model_save == None:
-            return
-        try:             
-            # Restore logic
-            if ratio < self.ma_load_ratio and episode_spacing > self.minimum_episode_spacing:
-                self.load_model(os.path.join(self.checkpoint_path, self.model_save))
-                self.load_optimizer(os.path.join(self.checkpoint_path, self.optimizer_save))
-                with open(os.path.join(self.checkpoint_path, self.ma_save), "r") as f:
-                    self.eval_ma = float(f.read())
-                
-                # Print in red
-                output = "\033[91mRestored model from episode {}\033[00m".format(self.latest_checkpoint_episode)
-                print(output)
-                self.latest_checkpoint_episode = episode
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-        
-    def save_model(self, path):
-        torch.save(self.network.state_dict(), path)
-        
-    def load_model(self, path):
-        self.network.load_state_dict(torch.load(path))
-        
-    def save_optimizer(self, path):
-        torch.save(self.optimizer.state_dict(), path)
-        
-    def load_optimizer(self, path):
-        self.optimizer.load_state_dict(torch.load(path))
-        
-    def save_hyperparameters(self, path):
-        # TODO
-        pass
-    
-    def load_hyperparameters(self, path):
-        # TODO
-        pass
-    
-def sweep_worker(parameter_name, value, episodes, env_kwargs, network_kwargs, ppo_kwargs):
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=DeprecationWarning)
-        
-        env = gym.make(**env_kwargs)
-        network = PPONetwork(**network_kwargs)
-        ppo_kwargs[parameter_name] = value
-        ppo = PPOWrapper(env, network, **ppo_kwargs)
-        
-        eval_series = ppo.train_model(episodes)
-        
-        return eval_series
-    
-def distribute_threads(threads, max_concurrent_threads):
-    # Step 1: Calculate the number of bins (denominator)
-    denominator = 1
-    conc_threads = threads
-    while conc_threads > max_concurrent_threads:
-        denominator += 1
-        conc_threads = threads / denominator
-    
-    # Step 2: Distribute threads into bins
-    conc_threads_sequence = []
-    for i in range(denominator):
-        # Calculate the number of threads to assign to this bin
-        t = (threads + denominator - 1 - i) // denominator  # Distribute threads as evenly as possible
-        conc_threads_sequence.append(t)
 
-    return conc_threads_sequence
+        # Save if moving average is the best
+        if self.eval_ma > self.eval_ma_max:
+            self.eval_ma_max = self.eval_ma
+            checkpoint_id = (
+                f"{self.checkpoint_folder}/model_{gen}_{str(uuid.uuid4())[:8]}"
+            )
+            self.save(checkpoint_id)
+            self.best_checkpoint = checkpoint_id
+            self.last_checkpoint = gen
 
-def parameter_sweeper(episodes, threads, parameter_name, parameter_values, env_kwargs, network_kwargs, ppo_kwargs, max_concurrent_threads=16, custom_name="custom"):
-    if parameter_name == None:
-        parameter_name = custom_name
-    if parameter_values == None:
-        parameter_values = [0]
-    
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    filename = f"{parameter_name}_sweep_{timestamp}"
-    folder = "param_sweeps/"
+            if self.debug_prints:
+                print(f"Checkpointing best model with reward: {self.eval_ma_max}")
 
-    print(f"Starting parameter: {parameter_name}, values: {parameter_values}")
-    
-    obj = {}
-    meta_data = {}
-    meta_data["parameter"] = parameter_name
-    meta_data["episodes"] = episodes
-    meta_data["threads"] = threads
-    meta_data["env_kwargs"] = env_kwargs
-    meta_data["network_kwargs"] = network_kwargs
-    meta_data["ppo_kwargs"] = ppo_kwargs
-    
-    obj["meta_data"] = meta_data
-    
-    sweeps = {}
-    for value in parameter_values:
-        print(f"\tRunning value: {value}")
-        
-        # Distribute threads      
-        conc_threads_sequence = distribute_threads(threads, max_concurrent_threads)      
-        results = np.zeros((threads, episodes))
-        
-        offset = 0
-        for t in conc_threads_sequence:
-            with ProcessPoolExecutor(max_workers=t) as executor:
-                futures = []
-                
-                # Submit the threads
-                for _ in range(t):
-                    futures.append(
-                        executor.submit(
-                            sweep_worker, parameter_name, value, episodes, env_kwargs, network_kwargs, ppo_kwargs.copy()
-                        )
-                    )
-            
-                # Wait for all threads to finish
-                for index, future in enumerate(as_completed(futures)):
-                    result = future.result()
-                    results[offset+index] = result
-                
-                # Update the offset
-                offset += t
-                
-        # Calculate the mean and std deviation as a series
-        result_mean = np.mean(results, axis=0)
-        result_mean = np.round(result_mean, 2)
-        
-        result_std = np.std(results, axis=0)
-        result_std = np.round(result_std, 2)
-                    
-        sweeps[value] = {
-            "mean": result_mean.tolist(),
-            "std": result_std.tolist()
-        }
-        
-    obj["sweeps"] = sweeps
-        
-    # Save the results 
-    with open(os.path.join(folder, f"{filename}.json"), "w") as f:
-        json.dump(obj, f, indent=4)
+        # Load if moving average is below threshold ...
+        cond0 = self.eval_ma < (
+            self.eval_ma_max / self.load_ratio
+            if self.eval_ma < 0
+            else self.eval_ma_max * self.load_ratio
+        )
+        # ... and grace period is met
+        cond1 = gen > self.last_checkpoint + self.grace_period * total_gens
 
-    # Return the filepath
-    return f"{folder}{filename}.json"
-
-def pick_parameter_sweep_results(filename):
-    # Pick result with greatets AOC
-    
-    with open(filename, "r") as f:
-        obj = json.load(f)
-        
-    param_name = obj["meta_data"]["parameter"]
-        
-    data = obj["sweeps"]
-    
-    best_parameter_value = None
-    best_mean = 0
-    
-    for i, (param, values) in enumerate(data.items()):
-        try:
-            param_value = int(param)  # Try converting to int
-        except ValueError:
+        if cond0 and cond1:
+            # Try in case of non-existing checkpoint
             try:
-                param_value = float(param)  # If int fails, try float
-            except ValueError:
-                param_value = param  # If both fail, keep as a string
+                self.load(self.best_checkpoint)
+                if self.debug_prints:
+                    print(f"Loading best model with reward: {self.eval_ma_max}")
+            except Exception as e:
+                print(f"Error loading best checkpoint: {e}")
+
+    def train(self, generations, save_folder=None, save_sequence=None):
+        # Pre-allocate storage
+        evolution = np.zeros(generations)
+
+        # Iterate through generations
+        for generation in range(generations):
+
+            # Collect trajectories
+            states, actions, log_probs, rewards, dones, truncateds, values = (
+                self.collect_trajectories()
+            )
+
+            # Compute advantages
+            advantages, returns = self.compute_advantages(
+                rewards, dones, truncateds, values
+            )
+
+            for epoch in range(self.batch_epochs):
+                # Shuffle data
+                if self.batch_shuffle:
+                    if self.seperate_envs_shuffle:
+                        # Shuffle along the sequence dimension for each environment
+                        for env in range(states.size(1)):
+                            env_indices = torch.randperm(states.size(0))
+
+                            # Apply shuffling for each environment independently along the sequence dimension
+                            states[:, env, :] = states[env_indices, env, :]
+                            actions[:, env] = actions[env_indices, env]
+                            log_probs[:, env] = log_probs[env_indices, env]
+                            advantages[:, env] = advantages[env_indices, env]
+                            returns[:, env] = returns[env_indices, env]
+                    else:
+                        # Shuffle along the sequence dimension
+                        indices = torch.randperm(self.iterations)
+
+                        states = states[indices]
+                        actions = actions[indices]
+                        log_probs = log_probs[indices]
+                        advantages = advantages[indices]
+                        returns = returns[indices]
+
+                # Iterate through batches
+                for start in range(0, len(states), self.batch_size):
+                    # Get batch
+                    end = start + self.batch_size
+
+                    batch_states = states[start:end]
+                    batch_actions = actions[start:end]
+                    batch_log_probs = log_probs[start:end]
+                    batch_advantages = advantages[start:end]
+                    batch_returns = returns[start:end]
+
+                    # New policies and values
+                    # new_policies, new_values = self.network(batch_states)
+                    # new_action_dist = torch.distributions.Categorical(new_policies)
+                    # new_log_probs = new_action_dist.log_prob(batch_actions)
+
+                    new_actions, new_log_probs, new_values, entropy = self.forward_pass(
+                        batch_states
+                    )
+
+                    # Check if new_values is a scalar
+                    if new_values.shape != batch_returns.shape:
+                        new_values = new_values.squeeze(-1)
+
+                    # Policy loss
+                    ratios = torch.exp(new_log_probs - batch_log_probs)
+                    surr1 = ratios * batch_advantages
+                    surr2 = (
+                        torch.clamp(ratios, 1 - self.clip_eps, 1 + self.clip_eps)
+                        * batch_advantages
+                    )
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    # Value loss
+                    value_loss = (
+                        self.value_coef
+                        * 0.5
+                        * (batch_returns - new_values).pow(2).mean()
+                    )
+
+                    # Entropy loss
+                    # entropies = -torch.sum(
+                    #     new_policies * torch.log(new_policies + 1e-8), dim=-1
+                    # )
+                    entropy_loss = -self.entropy_coef * entropy
+
+                    # Total loss
+                    loss = policy_loss + value_loss + entropy_loss
+
+                    # Backpropagation
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+
+            # Save model
+            if save_folder is not None and save_sequence is not None:
+                if generation in save_sequence:
+                    path = f"{save_folder}/model_{generation}"
+                    self.save(path)
+
+            # Evaluate
+            eval_reward_w_trunc, eval_reward_wo_trunc = self.evaluate()
+            # Store the evaluation reward without truncated rewards ...
+            # ... because trunc. rewards are artifical
+            evolution[generation] = eval_reward_wo_trunc
+            if self.debug_prints:
+                # TODO: Add a logger instead of print
+                pass
+            print(
+                f"Generation {generation:>4} - Reward: {eval_reward_w_trunc:8.2f}, w/o trunc.: {eval_reward_wo_trunc:8.2f}"
+            )
+
+            # TODO: Checkpointing
+            # self.checkpointer(eval_reward_wo_trunc, generation, generations)
+
+            # Parameter scheduler
+            self.parameter_scheduler(generation, generations)
+
+        return np.round(evolution, 2)
+
+
+class PPODiscrete(PPOBase):
+    def __init__(self, envs, network, *args, **kwargs):
+        super().__init__(envs, network, *args, **kwargs)
+
+        self.actions_dims = kwargs.get("actions_dims", 1)
+
+    def forward_pass(self, states_tensor):
+        policies, values = self.network(states_tensor)
         
-        mean = np.array(values['mean'])
-        if np.sum(mean) > best_mean:
-            best_mean = np.sum(mean)
-            best_parameter_value = param_value
-            
-    print(f"Best value for parameter {param_name}: {best_parameter_value}")
-    
-    return param_name, best_parameter_value
+        action_dist = torch.distributions.Categorical(policies)
+        actions = action_dist.sample()
 
-def moving_average_with_padding(data, window_size):
-    pad_before = np.zeros(window_size//2 )
-    pad_after = np.full((window_size//2,), data[-1])
-    
-    padded_data = np.concatenate((pad_before, data, pad_after))
-    
-    ma = np.convolve(padded_data, np.ones(window_size) / window_size, mode='valid')
-    
-    return ma
+        log_probs = action_dist.log_prob(actions)
 
-def plot_sweep_results(filename, moving_average=None):
-    # Load the data
-    with open(filename, "r") as f:
-        obj = json.load(f)
-        
-    data = obj["sweeps"]
-    
-    # Create a plot
-    fig, ax = plt.subplots()
+        entropy = action_dist.entropy().mean()
 
-    # Different colors for each line
-    colors = ['red', 'blue', 'green', 'purple', 'orange', 'cyan', 'magenta']
+        return actions, log_probs, values, entropy
 
-    # Loop through the data and plot each mean with its std deviation as a shaded area
-    for i, (param, values) in enumerate(data.items()):
-        mean = np.array(values['mean'])
-        std = np.array(values['std'])
-        
-        if moving_average:
-            mean_ma = moving_average_with_padding(mean, moving_average)
-            std_ma = moving_average_with_padding(std, moving_average)
-            
-            x = np.arange(len(mean_ma))
-            ax.plot(x, mean_ma, color=colors[i], label=f'{param}')
-            ax.fill_between(x, mean_ma - std_ma, mean_ma + std_ma, color=colors[i], alpha=0.07)
-        else:
-            x = np.arange(len(mean))
-            ax.plot(x, mean, color=colors[i], label=f'{param}')
-            ax.fill_between(x, mean - std, mean + std, color=colors[i], alpha=0.07)
-            
+    def eval_actions(self, states_tensor):
+        policies, _ = self.network(states_tensor)
 
-    # Add labels and a legend
-    ax.set_xlabel('Episode')
-    ax.set_ylabel('Reward')
-    ax.set_title('Sweep: {}'.format(obj["meta_data"]["parameter"]))
-    ax.legend()
-    
-    # Add grid
-    ax.grid()
-    
-    # Show the plot
-    plt.show()
+        return torch.argmax(policies, dim=-1)
+
+
+class PPOContinuous(PPOBase):
+    def __init__(self, envs, network, *args, **kwargs):
+        super().__init__(envs, network, *args, **kwargs)
+
+        self.actions_dims = kwargs.get("action_dims", None)
+
+        assert self.actions_dims != None, "Action dimensions must be provided"
+
+    def forward_pass(self, states_tensor):
+        means, log_vars, values = self.network(states_tensor)
+
+        std_devs = torch.exp(0.5 * log_vars)
+
+        action_dist = torch.distributions.Normal(means, std_devs)
+        actions = action_dist.rsample()
+        bounded_actions = torch.tanh(actions)
+
+        log_probs = (
+            action_dist.log_prob(actions) - torch.log(1 - bounded_actions.pow(2) + 1e-8)
+        ).sum(dim=-1)
+
+        entropy = action_dist.entropy().sum(dim=-1).mean()
+
+        return bounded_actions.detach(), log_probs, values, entropy
+
+    def eval_actions(self, states_tensor):
+        means, _, _ = self.network(states_tensor)
+
+        return torch.tanh(means).detach()
