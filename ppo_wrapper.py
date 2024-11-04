@@ -88,13 +88,17 @@ class PPOWrapper:
         self.load_ratio = 0.9  #! MAGIC NUMBER
 
         # Use CUDA > MPS > CPU
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else
-            "mps" if torch.backends.mps.is_available() else
-            "cpu"
-        )
-        self.network.to(self.device)
-
+        # self.device = torch.device(
+        #     "cuda"
+        #     if torch.cuda.is_available()
+        #     else "mps" if torch.backends.mps.is_available() else "cpu"
+        # )
+        #self.network.to(self.device)
+        # Print what device is being used
+        # print(f"Network using: {next(self.network.parameters()).device}")
+        # return
+              
+                            
         # Miscellaneous
         self.truncated_reward = kwargs.get("truncated_reward", 0)
         self.checkpointing = kwargs.get("checkpointing", False)
@@ -150,14 +154,27 @@ class PPOWrapper:
         dones = torch.zeros(self.iterations, self.num_envs)
         truncateds = torch.zeros(self.iterations, self.num_envs)
         values = torch.zeros(self.iterations, self.num_envs)
+        # & MPS
+        # states = torch.zeros(
+        #     self.iterations, self.num_envs, self.network.input_dims, device=self.device
+        # )
+        # actions = torch.zeros(self.iterations, self.num_envs, device=self.device)
+        # log_probs = torch.zeros(self.iterations, self.num_envs, device=self.device)
+        # rewards = torch.zeros(self.iterations, self.num_envs, device=self.device)
+        # dones = torch.zeros(self.iterations, self.num_envs, device=self.device)
+        # truncateds = torch.zeros(self.iterations, self.num_envs, device=self.device)
+        # values = torch.zeros(self.iterations, self.num_envs, device=self.device)
 
         # Reset environments
         current_states, infos = self.envs.reset()
-
         # Iterate through iterations
         for itr in range(self.iterations):
 
+            # & MPS
             states_tensor = torch.tensor(current_states, dtype=torch.float32)
+            # states_tensor = torch.tensor(
+            #     current_states, dtype=torch.float32, device=self.device
+            # )
 
             policies, current_values = self.network(states_tensor)
 
@@ -165,7 +182,9 @@ class PPOWrapper:
             current_actions = action_dist.sample()
 
             next_states, current_rewards, current_dones, current_truncateds, infos = (
+                # & MPS
                 self.envs.step(current_actions.numpy())
+                # self.envs.step(current_actions.cpu().numpy())
             )
 
             if current_truncateds.any():
@@ -180,9 +199,19 @@ class PPOWrapper:
             states[itr] = states_tensor
             actions[itr] = current_actions
             log_probs[itr] = current_log_probs.detach()
+            # & MPS
             rewards[itr] = torch.tensor(current_rewards, dtype=torch.float32)
             dones[itr] = torch.tensor(current_dones, dtype=torch.float32)
             truncateds[itr] = torch.tensor(current_truncateds, dtype=torch.float32)
+            # rewards[itr] = torch.tensor(
+            #     current_rewards, dtype=torch.float32, device=self.device
+            # )
+            # dones[itr] = torch.tensor(
+            #     current_dones, dtype=torch.float32, device=self.device
+            # )
+            # truncateds[itr] = torch.tensor(
+            #     current_truncateds, dtype=torch.float32, device=self.device
+            # )
             values[itr] = current_values.squeeze(-1).detach()
 
         return states, actions, log_probs, rewards, dones, truncateds, values
@@ -194,12 +223,20 @@ class PPOWrapper:
             rewards = self.reward_normalizer.normalize(rewards)
 
         # Initialize storage
+        # & MPS
         advantages = torch.zeros_like(rewards, dtype=torch.float32)
         returns = torch.zeros_like(rewards, dtype=torch.float32)
         gaes = torch.zeros(self.num_envs, dtype=torch.float32)
+        # advantages = torch.zeros_like(rewards, dtype=torch.float32, device=self.device)
+        # returns = torch.zeros_like(rewards, dtype=torch.float32, device=self.device)
+        # gaes = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
         # Add a zero value at the end
+        # & MPS
         values = torch.cat((values, torch.zeros((1, self.num_envs))), dim=0)
+        # values = torch.cat(
+        #     (values, torch.zeros((1, self.num_envs), device=self.device)), dim=0
+        # )
 
         # Compute advantages and returns
         for ti in reversed(range(rewards.size(0))):
@@ -233,7 +270,11 @@ class PPOWrapper:
         # Iterate through iterations
         for itr in range(self.iterations):
             # Get policies, no need for values
+            # & MPS
             states_tensor = torch.tensor(current_states, dtype=torch.float32)
+            # states_tensor = torch.tensor(
+            #     current_states, dtype=torch.float32, device=self.device
+            # )
             policies, _ = self.network(states_tensor)
 
             # Argmax because we are in evaluation mode
@@ -241,7 +282,9 @@ class PPOWrapper:
 
             # Step through environments
             next_states, current_rewards, current_dones, current_truncateds, infos = (
+                # & MPS
                 self.envs.step(actions.numpy())
+                #self.envs.step(actions.cpu().numpy())
             )
 
             # Add truncated rewards
