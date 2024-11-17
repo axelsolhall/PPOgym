@@ -136,7 +136,7 @@ class PPOBase:
 
         # Pre-allocate storage
         states = torch.zeros(self.iterations, self.num_envs, self.network.input_dims)
-        actions = torch.zeros(self.iterations, self.num_envs, self.actions_dims)
+        actions = torch.zeros(self.iterations, self.num_envs, self.action_dims)
         log_probs = torch.zeros(self.iterations, self.num_envs)
         rewards = torch.zeros(self.iterations, self.num_envs)
         dones = torch.zeros(self.iterations, self.num_envs)
@@ -151,8 +151,8 @@ class PPOBase:
             states_tensor = torch.tensor(current_states, dtype=torch.float32)
 
             # Get actions, log_probs and values
-            current_actions, current_log_probs, current_values, _ = self.forward_pass(
-                states_tensor
+            current_actions, current_log_probs, current_values = (
+                self.forward_pass_collect(states_tensor)
             )
 
             # Step through environments
@@ -161,8 +161,8 @@ class PPOBase:
             )
 
             # Check if current_actions is a scalar
-            # if current_actions.dim() == 1:
-            #     current_actions = current_actions.unsqueeze(-1)
+            if current_actions.dim() == 1:
+                current_actions = current_actions.unsqueeze(-1)
 
             # Add truncated rewards
             if current_truncateds.any():
@@ -173,7 +173,7 @@ class PPOBase:
 
             # Store data
             states[itr] = states_tensor
-            actions[itr] = current_actions
+            actions[itr] = current_actions  # .unsqueeze(-1)  # & Changed here
             log_probs[itr] = current_log_probs.detach()
             rewards[itr] = torch.tensor(current_rewards, dtype=torch.float32)
             dones[itr] = torch.tensor(current_dones, dtype=torch.float32)
@@ -229,10 +229,8 @@ class PPOBase:
         for itr in range(self.iterations):
             # Get policies, no need for values
             states_tensor = torch.tensor(current_states, dtype=torch.float32)
-            # policies, _ = self.network(states_tensor)
 
-            # # Argmax because we are in evaluation mode
-            # actions = torch.argmax(policies, dim=-1)
+            # Argmax because we are in evaluation mode
             actions = self.eval_actions(states_tensor)
 
             # Step through environments
@@ -378,12 +376,8 @@ class PPOBase:
                     batch_returns = returns[start:end]
 
                     # New policies and values
-                    # new_policies, new_values = self.network(batch_states)
-                    # new_action_dist = torch.distributions.Categorical(new_policies)
-                    # new_log_probs = new_action_dist.log_prob(batch_actions)
-
-                    new_actions, new_log_probs, new_values, entropy = self.forward_pass(
-                        batch_states
+                    new_log_probs, new_values, entropy = self.forward_pass_train(
+                        batch_states, batch_actions
                     )
 
                     # Check if new_values is a scalar
@@ -406,10 +400,11 @@ class PPOBase:
                         * (batch_returns - new_values).pow(2).mean()
                     )
 
-                    # Entropy loss
+                    # Entropy loss #! WTF
                     # entropies = -torch.sum(
                     #     new_policies * torch.log(new_policies + 1e-8), dim=-1
                     # )
+                    # entropy_loss = -self.entropy_coef * entropies.mean()
                     entropy_loss = -self.entropy_coef * entropy
 
                     # Total loss
@@ -431,9 +426,8 @@ class PPOBase:
             # Store the evaluation reward without truncated rewards ...
             # ... because trunc. rewards are artifical
             evolution[generation] = eval_reward_wo_trunc
-            if self.debug_prints:
-                # TODO: Add a logger instead of print
-                pass
+
+            # TODO: Add a logger instead of print
             print(
                 f"Generation {generation:>4} - Reward: {eval_reward_w_trunc:8.2f}, w/o trunc.: {eval_reward_wo_trunc:8.2f}"
             )
@@ -451,35 +445,44 @@ class PPODiscrete(PPOBase):
     def __init__(self, envs, network, *args, **kwargs):
         super().__init__(envs, network, *args, **kwargs)
 
-        self.actions_dims = kwargs.get("actions_dims", 1)
+        self.action_dims = kwargs.get("action_dims", 1)
 
-    def forward_pass(self, states_tensor):
+    def forward_pass_collect(self, states_tensor):
         policies, values = self.network(states_tensor)
-        
+
         action_dist = torch.distributions.Categorical(policies)
         actions = action_dist.sample()
 
         log_probs = action_dist.log_prob(actions)
 
-        entropy = action_dist.entropy().mean()
+        return actions, log_probs, values
 
-        return actions, log_probs, values, entropy
+    def forward_pass_train(self, states_tensor, actions_tensor):
+        policies, values = self.network(states_tensor)
+
+        action_dist = torch.distributions.Categorical(policies)
+        log_probs = action_dist.log_prob(actions_tensor.squeeze(-1))
+
+        # entropy = action_dist.entropy().mean()
+        entropy = -torch.sum(policies * torch.log(policies + 1e-8), dim=-1).mean()
+
+        return log_probs, values, entropy
 
     def eval_actions(self, states_tensor):
         policies, _ = self.network(states_tensor)
 
-        return torch.argmax(policies, dim=-1)
+        return torch.argmax(policies, dim=-1).detach()
 
 
 class PPOContinuous(PPOBase):
     def __init__(self, envs, network, *args, **kwargs):
         super().__init__(envs, network, *args, **kwargs)
 
-        self.actions_dims = kwargs.get("action_dims", None)
+        self.action_dims = kwargs.get("action_dims", None)
 
-        assert self.actions_dims != None, "Action dimensions must be provided"
+        assert self.action_dims != None, "Action dimensions must be provided"
 
-    def forward_pass(self, states_tensor):
+    def forward_pass_collect(self, states_tensor):
         means, log_vars, values = self.network(states_tensor)
 
         std_devs = torch.exp(0.5 * log_vars)
@@ -492,11 +495,31 @@ class PPOContinuous(PPOBase):
             action_dist.log_prob(actions) - torch.log(1 - bounded_actions.pow(2) + 1e-8)
         ).sum(dim=-1)
 
-        entropy = action_dist.entropy().sum(dim=-1).mean()
+        return bounded_actions.detach(), log_probs, values
 
-        return bounded_actions.detach(), log_probs, values, entropy
+    def forward_pass_train(self, states_tensor, actions_tensor):
+        means, log_vars, values = self.network(states_tensor)
+
+        std_devs = torch.exp(0.5 * log_vars)
+
+        action_dist = torch.distributions.Normal(means, std_devs)
+
+        log_probs = (
+            action_dist.log_prob(actions_tensor)
+            - torch.log(1 - actions_tensor.pow(2) + 1e-8)
+        ).sum(dim=-1)
+
+        # entropy = action_dist.entropy().sum(dim=-1).mean()
+        #entropy = action_dist.entropy().mean()
+        entropy = -torch.sum(
+            0.5 * (log_vars + np.log(2 * np.pi * np.e)), dim=-1
+        ).mean()
+
+        return log_probs, values, entropy
 
     def eval_actions(self, states_tensor):
         means, _, _ = self.network(states_tensor)
 
-        return torch.tanh(means).detach()
+        means = means.detach()
+
+        return torch.tanh(means)

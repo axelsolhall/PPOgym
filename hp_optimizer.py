@@ -47,7 +47,7 @@ def run_thread(
         return evolution
 
 
-class HPOptimizer:
+class HPTuner:
     def __init__(
         self,
         env_kwargs,
@@ -288,7 +288,7 @@ class HPOptimizer:
 
         while True:
             p = parameters[parameter_idx]
-            
+
             p, p_vals = self.sweep_values(p)
 
             print(f"Optimizing {p} with values: {p_vals}")
@@ -300,7 +300,7 @@ class HPOptimizer:
             serieses_std = np.zeros((len(p_vals), generations))
             serieses_score = np.zeros((len(p_vals), generations))
             final_score = np.zeros(len(p_vals))
-            
+
             # Run trials for each value
             for i, pv in enumerate(p_vals):
 
@@ -312,7 +312,7 @@ class HPOptimizer:
                 if score_load is not None:
                     mean, std, score, final_score_value = score_load
                     print(f"Skipping {p} = {pv}, score: {final_score_value:.2f}")
-                    
+
                     # Store the results
                     serieses_mean[i] = mean
                     serieses_std[i] = std
@@ -322,7 +322,6 @@ class HPOptimizer:
                     # Move to the next parameter
                     continue
 
-
                 # ... else run trials for those values
                 print(f"Running trials for {p} = {pv}")
 
@@ -331,7 +330,7 @@ class HPOptimizer:
                 serieses_std[i] = np.std(series, axis=0)
                 serieses_score[i] = (  # Score is mean - std/2
                     serieses_mean[i] - serieses_std[i] * 0.5  #! MAGIC NUMBER
-                ) # TODO: Maybe sqrt(std) instead of std/2
+                )  # TODO: Maybe sqrt(std) instead of std/2
                 final_score[i] = np.sum(serieses_score[i])
 
                 # Log the results
@@ -475,11 +474,9 @@ class HPOptimizer:
             frames = 0
             while not done and frames < max_frames:
                 state_tensor = torch.tensor(state, dtype=torch.float32)
-                policy, _ = ppo_instance.network(state_tensor)
+                action = ppo_instance.eval_actions(state_tensor)
 
-                action = torch.argmax(policy).item()
-
-                state, reward, done, truncated, info = env_single.step(action)
+                state, reward, done, truncated, info = env_single.step(action.numpy())
 
                 if truncated:
                     done = True
