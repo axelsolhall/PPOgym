@@ -1,6 +1,6 @@
 # Torch imports
 import torch
-from torch.utils.tensorboard import SummaryWriter
+
 
 # Gym imports
 import gym
@@ -31,7 +31,8 @@ def run_thread(
     generations,
 ):
     with warnings.catch_warnings():
-        # warnings.filterwarnings("ignore", category=DeprecationWarning)
+        # Ignore deprecation warnings
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
 
         envs_vector = SyncVectorEnv([lambda: make_env(env_kwargs)] * num_envs)
         envs_vector.reset()
@@ -293,6 +294,7 @@ class HPTuner:
 
             print(f"Optimizing {p} with values: {p_vals}")
 
+            # Store the current value to check for change
             p_val_before = self.ppo_kwargs[p]
 
             # Pre-allocate storage
@@ -325,13 +327,11 @@ class HPTuner:
                 # ... else run trials for those values
                 print(f"Running trials for {p} = {pv}")
 
+                # Run the trials
                 series = self.run_trials(generations, num_trials)
                 serieses_mean[i] = np.mean(series, axis=0)
                 serieses_std[i] = np.std(series, axis=0)
-                # Score is mean - std/2 #! MAGIC NUMBER
-                # serieses_score[i] = (
-                #     serieses_mean[i] - serieses_std[i] * 0.5
-                # )
+
                 # Score is mean - sqrt(std) #! MAGIC FORMULA
                 serieses_score[i] = serieses_mean[i] - np.sqrt(serieses_std[i])
 

@@ -414,7 +414,7 @@ class PPOBase:
                     self.optimizer.step()
 
             # Save model
-            if save_folder is not None and save_sequence is not None:
+            if save_sequence is not None and save_folder is not None:
                 if generation in save_sequence:
                     path = f"{save_folder}/model_{generation}"
                     self.save(path)
@@ -425,13 +425,13 @@ class PPOBase:
             # ... because trunc. rewards are artifical
             evolution[generation] = eval_reward_wo_trunc
 
-            # TODO: Add a logger instead of print
             if self.debug_prints:
                 print(
                     f"Generation {generation:>4} - Reward: {eval_reward_w_trunc:8.2f}, w/o trunc.: {eval_reward_wo_trunc:8.2f}"
                 )
 
-            # TODO: Checkpointing
+            # TODO: Implement checkpointing
+            # Call the checkpointer
             # self.checkpointer(eval_reward_wo_trunc, generation, generations)
 
             # Parameter scheduler
@@ -508,6 +508,7 @@ class PPOContinuous(PPOBase):
             - torch.log(1 - actions_tensor.pow(2) + 1e-8)
         ).sum(dim=-1)
 
+        # TODO: Check if this is correct
         # entropy = action_dist.entropy().sum(dim=-1).mean()
         # entropy = action_dist.entropy().mean()
         entropy = -torch.sum(0.5 * (log_vars + np.log(2 * np.pi * np.e)), dim=-1).mean()

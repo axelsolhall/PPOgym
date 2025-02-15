@@ -54,6 +54,7 @@ class PPONetworkBase(nn.Module):
 
         # TODO - Add support for other initialization methods
 
+        # Apply He initialization to all Linear layers followed by supported activations
         for i, module in enumerate(layers):
             # Check if the current module is Linear and is followed by a supported activation
             if isinstance(module, nn.Linear):
